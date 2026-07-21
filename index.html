@@ -457,12 +457,16 @@
    STORAGE LAYER (Claude artifact persistent storage)
    ============================================================ */
 async function storeGet(key){
-  try{ const r = await window.storage.get(key, false); return r ? JSON.parse(r.value) : null; }
-  catch(e){ return null; }
+  try{
+    const raw = window.localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch(e){ console.error('storage get failed', e); return null; }
 }
 async function storeSet(key, value){
-  try{ await window.storage.set(key, JSON.stringify(value), false); return true; }
-  catch(e){ console.error('storage set failed', e); return false; }
+  try{
+    window.localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch(e){ console.error('storage set failed', e); return false; }
 }
 
 function hashPass(pass){
