@@ -6,6 +6,7 @@
 <title>The Ledger — Betting Tracker</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;600;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <style>
   :root{
     --felt-dark:#0a1e17;
@@ -454,32 +455,23 @@
 
 <script>
 /* ============================================================
-   STORAGE LAYER (Claude artifact persistent storage)
+   CLOUD DATABASE (Supabase) — fill these in from your project's
+   Settings -> API page, then re-upload this file.
    ============================================================ */
-async function storeGet(key){
-  try{
-    const raw = window.localStorage.getItem(key);
-    return raw ? JSON.parse(raw) : null;
-  } catch(e){ console.error('storage get failed', e); return null; }
-}
-async function storeSet(key, value){
-  try{
-    window.localStorage.setItem(key, JSON.stringify(value));
-    return true;
-  } catch(e){ console.error('storage set failed', e); return false; }
-}
+const SUPABASE_URL = 'YOUR_SUPABASE_URL_HERE';
+const SUPABASE_ANON_KEY = 'YOUR_SUPABASE_ANON_KEY_HERE';
 
-function hashPass(pass){
-  // Lightweight local obfuscation only — not cryptographic security.
-  let h = 5381;
-  for (let i=0;i<pass.length;i++){ h = ((h*33) ^ pass.charCodeAt(i)) >>> 0; }
-  return h.toString(16) + ':' + pass.length;
-}
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// Supabase Auth is email-based; we turn the chosen username into a
+// stand-in address behind the scenes so the UI can stay username/password.
+function usernameToEmail(user){ return user.toLowerCase() + '@ledger.local'; }
 
 /* ============================================================
    STATE
    ============================================================ */
 let currentUser = null;
+let currentUserId = null;
 let bets = [];        // {id, kind:'single'|'acca', label, odds, legs, stake, date, status}
 let priorLosses = [];  // {id, amount, date, note}
 let legCount = 0;
@@ -505,16 +497,23 @@ async function handleSignup(e){
   if(!/^[a-z0-9_\-]+$/i.test(user)){ msg.textContent='Use letters, numbers, _ or - only.'; msg.className='auth-msg err'; return false; }
   if(pass !== pass2){ msg.textContent='Passwords do not match.'; msg.className='auth-msg err'; return false; }
 
-  const existing = await storeGet('user:'+user);
-  if(existing){ msg.textContent='That username is already taken.'; msg.className='auth-msg err'; return false; }
-
-  await storeSet('user:'+user, { passwordHash: hashPass(pass), createdAt: new Date().toISOString() });
-  await storeSet('bets:'+user, []);
-  await storeSet('priorlosses:'+user, []);
+  const { data, error } = await sb.auth.signUp({ email: usernameToEmail(user), password: pass });
+  if(error){
+    msg.textContent = /registered/i.test(error.message) ? 'That username is already taken.' : error.message;
+    msg.className='auth-msg err';
+    return false;
+  }
+  if(!data.session){
+    msg.textContent = 'Account created — please sign in.';
+    msg.className='auth-msg ok';
+    setTimeout(()=>switchAuthTab('login'), 800);
+    return false;
+  }
 
   msg.textContent='Account created. Signing you in…';
   msg.className='auth-msg ok';
-  setTimeout(()=>enterApp(user), 500);
+  currentUserId = data.user.id;
+  setTimeout(()=>enterApp(user), 400);
   return false;
 }
 
@@ -524,22 +523,23 @@ async function handleLogin(e){
   const pass = document.getElementById('loginPass').value;
   const msg = document.getElementById('loginMsg');
 
-  const record = await storeGet('user:'+user);
-  if(!record || record.passwordHash !== hashPass(pass)){
+  const { data, error } = await sb.auth.signInWithPassword({ email: usernameToEmail(user), password: pass });
+  if(error){
     msg.textContent = 'Incorrect username or password.';
     msg.className = 'auth-msg err';
     return false;
   }
   msg.textContent = 'Welcome back.';
   msg.className = 'auth-msg ok';
+  currentUserId = data.user.id;
   setTimeout(()=>enterApp(user), 250);
   return false;
 }
 
 async function enterApp(user){
   currentUser = user;
-  bets = (await storeGet('bets:'+user)) || [];
-  priorLosses = (await storeGet('priorlosses:'+user)) || [];
+  await loadBets();
+  await loadPrior();
 
   document.getElementById('authScreen').style.display = 'none';
   document.getElementById('app').style.display = 'block';
@@ -554,8 +554,10 @@ async function enterApp(user){
   renderAll();
 }
 
-function logout(){
+async function logout(){
+  await sb.auth.signOut();
   currentUser = null;
+  currentUserId = null;
   bets = [];
   priorLosses = [];
   document.getElementById('app').style.display = 'none';
@@ -563,6 +565,16 @@ function logout(){
   document.getElementById('loginForm').reset();
   document.getElementById('signupForm').reset();
   switchAuthTab('login');
+}
+
+// Auto sign-in if this browser already has a valid Supabase session
+async function checkExistingSession(){
+  const { data } = await sb.auth.getSession();
+  if(data && data.session){
+    currentUserId = data.session.user.id;
+    const user = data.session.user.email.replace('@ledger.local','');
+    await enterApp(user);
+  }
 }
 
 /* ============================================================
@@ -576,10 +588,24 @@ function switchView(view){
 }
 
 /* ============================================================
-   SAVE HELPERS
+   DATA LOAD / MAP HELPERS
    ============================================================ */
-async function persistBets(){ await storeSet('bets:'+currentUser, bets); }
-async function persistPrior(){ await storeSet('priorlosses:'+currentUser, priorLosses); }
+function mapBetRow(row){
+  return {
+    id: row.id, kind: row.kind, label: row.label,
+    odds: Number(row.odds), stake: Number(row.stake),
+    date: row.date, status: row.status,
+    legs: row.legs || undefined
+  };
+}
+async function loadBets(){
+  const { data, error } = await sb.from('bets').select('*').eq('user_id', currentUserId).order('date', { ascending:false });
+  bets = error ? [] : data.map(mapBetRow);
+}
+async function loadPrior(){
+  const { data, error } = await sb.from('prior_losses').select('*').eq('user_id', currentUserId).order('date', { ascending:false });
+  priorLosses = error ? [] : data.map(row=>({ id:row.id, amount:Number(row.amount), date:row.date, note:row.note }));
+}
 
 /* ============================================================
    NEW SINGLE BET
@@ -602,8 +628,10 @@ async function handleAddBet(e){
   const date = document.getElementById('betDate').value;
   const status = document.getElementById('betStatus').value;
 
-  bets.push({ id:'b'+Date.now(), kind:'single', label, odds, stake, date, status });
-  await persistBets();
+  const { data, error } = await sb.from('bets')
+    .insert({ user_id: currentUserId, kind:'single', label, odds, stake, date, status })
+    .select().single();
+  if(!error) bets.push(mapBetRow(data));
 
   e.target.reset();
   document.getElementById('betDate').value = new Date().toISOString().slice(0,10);
@@ -668,12 +696,14 @@ async function handleAddAcca(e){
   const date = document.getElementById('accaDate').value;
   const status = document.getElementById('accaStatus').value;
 
-  bets.push({
-    id:'a'+Date.now(), kind:'acca',
-    label: legs.map(l=>l.label).join(' + '),
-    legs, odds: combined, stake, date, status
-  });
-  await persistBets();
+  const { data, error } = await sb.from('bets')
+    .insert({
+      user_id: currentUserId, kind:'acca',
+      label: legs.map(l=>l.label).join(' + '),
+      legs, odds: combined, stake, date, status
+    })
+    .select().single();
+  if(!error) bets.push(mapBetRow(data));
 
   e.target.reset();
   document.getElementById('accaDate').value = new Date().toISOString().slice(0,10);
@@ -693,16 +723,18 @@ async function handleAddPrior(e){
   const date = document.getElementById('priorDate').value || '';
   const note = document.getElementById('priorNote').value.trim() || 'Prior loss';
 
-  priorLosses.push({ id:'p'+Date.now(), amount, date, note });
-  await persistPrior();
+  const { data, error } = await sb.from('prior_losses')
+    .insert({ user_id: currentUserId, amount, date: date || null, note })
+    .select().single();
+  if(!error) priorLosses.push({ id:data.id, amount:Number(data.amount), date:data.date, note:data.note });
 
   e.target.reset();
   renderAll();
   return false;
 }
 async function removePrior(id){
+  await sb.from('prior_losses').delete().eq('id', id);
   priorLosses = priorLosses.filter(p=>p.id!==id);
-  await persistPrior();
   renderAll();
 }
 
@@ -710,14 +742,14 @@ async function removePrior(id){
    BET ACTIONS
    ============================================================ */
 async function settleBet(id, status){
+  await sb.from('bets').update({ status }).eq('id', id);
   const b = bets.find(x=>x.id===id);
   if(b) b.status = status;
-  await persistBets();
   renderAll();
 }
 async function deleteBet(id){
+  await sb.from('bets').delete().eq('id', id);
   bets = bets.filter(b=>b.id!==id);
-  await persistBets();
   renderAll();
 }
 
@@ -952,6 +984,7 @@ document.getElementById('topDie').innerHTML = dieSvg(30,'#7a1f2b');
 resetLegRows();
 liveBetCalc();
 liveAccaCalc();
+checkExistingSession();
 </script>
 </body>
 </html>
